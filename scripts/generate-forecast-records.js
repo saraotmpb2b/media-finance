@@ -96,26 +96,86 @@ const relevantDeliverables = deliverableQuery.records.filter(del => {
 
 console.log(`Found ${relevantDeliverables.length} deliverables for active campaigns (filtered from ${deliverableQuery.records.length} total)`);
 
+// Build a Campaign/Vendor/Tactic lookup for EVERY deliverable (not just active-campaign
+// ones), keyed by deliverable record ID. This is the live, current-truth source used
+// below to re-derive existing Actualisation records' combo key, since a deliverable's
+// Vendor or Tactic can be edited/reassigned after Actualisation rows were created.
+const deliverableInfoMap = new Map();
+for (const del of deliverableQuery.records) {
+    const delCampaign = del.getCellValue(CONFIG.deliverableCampaignField);
+    const delVendor = del.getCellValue(CONFIG.deliverableVendorField);
+    const delTacticRaw = del.getCellValue(CONFIG.deliverableTacticField);
+    const delTactic = delTacticRaw?.name || delTacticRaw;
+
+    if (!delCampaign || !delVendor || !delTactic) continue;
+
+    deliverableInfoMap.set(del.id, {
+        campaignId: delCampaign[0].id,
+        vendorId: delVendor[0].id,
+        tactic: delTactic
+    });
+}
+
 // Get existing actualisation records
 const actualisationQuery = await actualisationTable.selectRecordsAsync({
     fields: ["Campaign", "Vendor", "Tactic", "Month", "Record Type", "Client Revenue", "Estimated Vendor Cost", "Forecasted Margin $", "Margin %", "Deliverables", "Actual Spend", "Data Warnings", "Budget Category", "Total Tactic/Vendor Budget", "Previous Months Actual"]
 });
 
 // BUILD LOOKUP MAP - keyed by YYYY-MM string to avoid timezone issues
+//
+// The key is built from Campaign/Vendor/Tactic resolved through the record's LINKED
+// Deliverables whenever possible, rather than the record's own Vendor/Tactic fields
+// (which are a snapshot frozen at the time the row was created/last written). Without
+// this, editing a deliverable's Tactic or Vendor after the fact (retagging, fixing a
+// duplicate select option, reassigning) makes the old rows permanently unmatchable:
+// the script forks a brand-new series instead of continuing the old one, and
+// "Previous Months Actual" silently loses everything recorded under the old label.
+// Falls back to the record's own fields when no linked deliverable resolves (e.g. it
+// was deleted) so historical rows with no surviving deliverable still get keyed.
 const existingRecordsMap = new Map();
+const unresolvedActiveForecastRecords = [];
 
 for (const record of actualisationQuery.records) {
-    const recCampaign = record.getCellValue("Campaign");
-    const recVendor = record.getCellValue("Vendor");
-    const recTactic = record.getCellValue("Tactic");
     const recMonth = record.getCellValue("Month");
+    if (!recMonth) continue;
 
-    if (!recCampaign || !recVendor || !recMonth) continue;
+    const recDeliverables = record.getCellValue("Deliverables");
+    let resolvedCampaignId, resolvedVendorId, resolvedTactic;
+
+    for (const linkedDel of recDeliverables || []) {
+        const info = deliverableInfoMap.get(linkedDel.id);
+        if (info) {
+            resolvedCampaignId = info.campaignId;
+            resolvedVendorId = info.vendorId;
+            resolvedTactic = info.tactic;
+            break;
+        }
+    }
+
+    const resolvedViaLiveDeliverable = Boolean(resolvedCampaignId && resolvedVendorId);
+
+    if (!resolvedViaLiveDeliverable) {
+        const recCampaign = record.getCellValue("Campaign");
+        const recVendor = record.getCellValue("Vendor");
+        const recTactic = record.getCellValue("Tactic");
+
+        if (!recCampaign || !recVendor) continue;
+
+        resolvedCampaignId = recCampaign[0].id;
+        resolvedVendorId = recVendor[0].id;
+        resolvedTactic = recTactic;
+    }
 
     const monthDate = new Date(recMonth);
-    const key = `${recCampaign[0].id}|${recVendor[0].id}|${recTactic}|${monthKey(monthDate)}`;
+    const key = `${resolvedCampaignId}|${resolvedVendorId}|${resolvedTactic}|${monthKey(monthDate)}`;
 
     existingRecordsMap.set(key, record);
+
+    // Only worth flagging when the campaign is still active - a non-live campaign
+    // naturally has no current deliverable to resolve against, and that's expected.
+    if (!resolvedViaLiveDeliverable && activeCampaignIds.has(resolvedCampaignId)) {
+        unresolvedActiveForecastRecords.push(record);
+    }
 }
 
 console.log(`Built lookup map with ${existingRecordsMap.size} existing records`);
@@ -500,10 +560,42 @@ for (const [comboKey, combo] of combinations) {
 
 console.log(`Maintenance updates queued: ${maintenanceUpdates.length}`);
 
+// =========================================================================
+// ORPHAN WARNING PASS: Flag Forecast records for still-active campaigns whose
+// combo could not be resolved to any currently-live deliverable (its linked
+// deliverable was likely deleted). These rows are otherwise untouched by the
+// main loop or maintenance pass, so without this they'd silently sit with
+// stale Total Tactic/Vendor Budget / Previous Months Actual values.
+// =========================================================================
+const ORPHAN_WARNING = "No live deliverable could be matched to this record (it may have been deleted or reassigned) - Total Tactic/Vendor Budget and Previous Months Actual may be stale. Please review.";
+const orphanWarningUpdates = [];
+
+for (const record of unresolvedActiveForecastRecords) {
+    const recType = record.getCellValue("Record Type");
+    const recTypeText = recType?.name || recType;
+    if (recTypeText !== "Forecast") continue;
+
+    const existingWarnings = record.getCellValue("Data Warnings") || "";
+    if (existingWarnings.includes(ORPHAN_WARNING)) continue;
+
+    const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) || maintenanceUpdates.some(r => r.id === record.id);
+    if (alreadyQueued) continue;
+
+    orphanWarningUpdates.push({
+        id: record.id,
+        fields: {
+            "Data Warnings": existingWarnings ? `${existingWarnings}\n${ORPHAN_WARNING}` : ORPHAN_WARNING
+        }
+    });
+}
+
+console.log(`Orphan warnings queued: ${orphanWarningUpdates.length}`);
+
 // Execute
 let created = 0;
 let updated = 0;
 let maintained = 0;
+let flagged = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -529,11 +621,20 @@ if (maintenanceUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}`);
+if (orphanWarningUpdates.length > 0) {
+    while (orphanWarningUpdates.length > 0) {
+        const batch = orphanWarningUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        flagged += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
     output.set('recordsUpdated', updated);
     output.set('recordsMaintained', maintained);
+    output.set('recordsFlagged', flagged);
     output.set('status', 'success');
 }
