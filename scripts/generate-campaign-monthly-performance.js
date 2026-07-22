@@ -23,12 +23,12 @@ const actualRecords = actualisationQuery.records.filter(record => {
     return recTypeText === "Actual";
 });
 
-console.log(`Found ${actualRecords.length} Actual records (out of ${actualisationQuery.records.length} total)`);
+console.log("Found " + actualRecords.length + " Actual records (out of " + actualisationQuery.records.length + " total)");
 
 // Roll up Client Revenue and Actual Spend by Campaign + Month, across every
 // vendor/tactic - this report is a campaign-level summary, not a deliverable breakdown.
 function monthKey(date) {
-    return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+    return date.getUTCFullYear() + "-" + String(date.getUTCMonth() + 1).padStart(2, '0');
 }
 
 const rollups = new Map();
@@ -41,7 +41,7 @@ for (const record of actualRecords) {
     const campaignId = campaign[0].id;
     const campaignName = campaign[0].name;
     const monthDate = new Date(month);
-    const key = `${campaignId}|${monthKey(monthDate)}`;
+    const key = campaignId + "|" + monthKey(monthDate);
 
     if (!rollups.has(key)) {
         rollups.set(key, {
@@ -58,7 +58,7 @@ for (const record of actualRecords) {
     rollup.actualSpend += record.getCellValue(CONFIG.actualSpendField) || 0;
 }
 
-console.log(`Rolled up into ${rollups.size} Campaign+Month combinations`);
+console.log("Rolled up into " + rollups.size + " Campaign+Month combinations");
 
 // Get existing Campaign Monthly Performance records to decide create vs. update
 const performanceQuery = await performanceTable.selectRecordsAsync({
@@ -72,7 +72,7 @@ for (const record of performanceQuery.records) {
     if (!campaign || !month) continue;
 
     const monthDate = new Date(month);
-    const key = `${campaign[0].id}|${monthKey(monthDate)}`;
+    const key = campaign[0].id + "|" + monthKey(monthDate);
     existingMap.set(key, record);
 }
 
@@ -83,7 +83,7 @@ for (const [key, rollup] of rollups) {
     const clientRevenueRounded = Math.round(rollup.clientRevenue * 100) / 100;
     const actualSpendRounded = Math.round(rollup.actualSpend * 100) / 100;
     const monthLabel = rollup.month.toLocaleDateString('en-US', {month: 'short', year: 'numeric', timeZone: 'UTC'});
-    const name = `${rollup.campaignName} — ${monthLabel}`;
+    const name = rollup.campaignName + " - " + monthLabel;
 
     const existingRecord = existingMap.get(key);
 
@@ -117,7 +117,7 @@ for (const [key, rollup] of rollups) {
     }
 }
 
-console.log(`Records to create: ${recordsToCreate.length}, Records to update: ${recordsToUpdate.length}`);
+console.log("Records to create: " + recordsToCreate.length + ", Records to update: " + recordsToUpdate.length);
 
 // Execute
 let created = 0;
@@ -139,7 +139,7 @@ if (recordsToUpdate.length > 0) {
     }
 }
 
-console.log(`✅ Campaign Monthly Performance refreshed! Created: ${created}, Updated: ${updated}`);
+console.log("Campaign Monthly Performance refreshed! Created: " + created + ", Updated: " + updated);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
