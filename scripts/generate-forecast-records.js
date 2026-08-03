@@ -173,11 +173,15 @@ function filledFieldCount(record) {
     return filled;
 }
 
-// Actual Spend only counts when the row is actually marked Actual.
-function actualSpendOf(record) {
+function isActualRecord(record) {
     const recType = record.getCellValue("Record Type");
     const recTypeText = recType?.name || recType;
-    if (recTypeText !== "Actual") return 0;
+    return recTypeText === "Actual";
+}
+
+// Actual Spend only counts when the row is actually marked Actual.
+function actualSpendOf(record) {
+    if (!isActualRecord(record)) return 0;
     return record.getCellValue("Actual Spend") || 0;
 }
 
@@ -259,21 +263,34 @@ for (const slot of existingRecordsMap.values()) duplicateRowCount += slot.duplic
 
 console.log(`Built lookup map with ${existingRecordsMap.size} combo+month slots covering ${existingRecordsMap.size + duplicateRowCount} existing records (${duplicateRowCount} duplicate rows)`);
 
-// Index Actual Spend by combo, built from slot PRIMARIES only. Summing every row
-// would double-count duplicates; summing a map that had silently dropped them lost
-// their spend entirely. Primaries are chosen to be the spend-carrying row, so this
-// both avoids double counting and stops losing recorded actuals.
+// Index closed (Actual) months by combo, built from slot PRIMARIES only. Summing
+// every row would double-count duplicates; summing a map that had silently dropped
+// them lost their spend entirely. Primaries are chosen to be the spend-carrying row,
+// so this both avoids double counting and stops losing recorded actuals.
+//
+// Each entry carries BOTH figures, because they answer different questions:
+//   spend   - Actual Spend, i.e. net vendor cost. Only meaningful on a row marked
+//             Actual. Feeds "Previous Months Actual", which finance reads as
+//             literally "what we paid out".
+//   revenue - Client Revenue on the row, i.e. gross, recorded regardless of Record
+//             Type. Feeds the reweighting of remaining budget (getRecognisedRevenue).
+//             Deliberately label-independent: the reweight only ever looks at months
+//             that have already ended, and an ended month represents delivered time
+//             whether or not anyone got round to relabelling it Actual. Keying off
+//             the label instead would make the forecast depend on how promptly the
+//             month was closed by hand.
 const actualsByCombo = new Map();
 for (const slot of existingRecordsMap.values()) {
     const spend = actualSpendOf(slot.primary);
-    if (!spend) continue;
+    const revenue = slot.primary.getCellValue("Client Revenue") || 0;
+    if (!spend && !revenue) continue;
 
     const recMonth = slot.primary.getCellValue("Month");
     if (!recMonth) continue;
 
     const comboKey = `${slot.resolvedCampaignId}|${slot.resolvedVendorId}|${slot.resolvedTactic}`;
     if (!actualsByCombo.has(comboKey)) actualsByCombo.set(comboKey, []);
-    actualsByCombo.get(comboKey).push({time: new Date(recMonth).getTime(), spend: spend});
+    actualsByCombo.get(comboKey).push({time: new Date(recMonth).getTime(), spend: spend, revenue: revenue});
 }
 
 // Helper: Calculate days in month for a deliverable
@@ -306,7 +323,9 @@ function calculateDeliverableBudget(deliverable, monthStart, monthEnd) {
     return (budget / totalDays) * daysInMonth;
 }
 
-// Helper: Get previous actuals for reweighting
+// Helper: Sum Actual Spend on closed months before a cutoff. This is the figure
+// written to "Previous Months Actual" - net vendor cost, exactly as the name says.
+// It is NOT the right basis for reweighting; see getRecognisedRevenue.
 function getPreviousActuals(campaignId, vendorId, tactic, beforeMonth) {
     const entries = actualsByCombo.get(`${campaignId}|${vendorId}|${tactic}`);
     if (!entries) return 0;
@@ -318,6 +337,36 @@ function getPreviousActuals(campaignId, vendorId, tactic, beforeMonth) {
     }
 
     return totalActuals;
+}
+
+// Helper: Sum Client Revenue already recognised on closed months before a cutoff.
+//
+// This - not Actual Spend - is what must be subtracted from the total budget when
+// reweighting the remaining forecast, for two reasons:
+//
+//  1. Units. The total budget is a sum of Planned Budget, which is GROSS client
+//     revenue. Actual Spend is NET vendor cost. Subtracting net from gross and
+//     assigning the result to Client Revenue silently leaks the margin.
+//  2. Month close. A row flipped to Actual before finance enters Actual Spend
+//     reports $0 spend, so the old basis concluded that nothing had been consumed
+//     and re-spread the whole budget across the remaining months - while that
+//     closed row still carried its revenue. The same money got counted twice, worst
+//     in the month just closed. Client Revenue is present on the row from the moment
+//     it is created, so it does not have that blind spot.
+//
+// Only ever called with a cutoff at the first forecast month, so every row it sums
+// belongs to a month that has already ended.
+function getRecognisedRevenue(campaignId, vendorId, tactic, beforeMonth) {
+    const entries = actualsByCombo.get(`${campaignId}|${vendorId}|${tactic}`);
+    if (!entries) return 0;
+
+    const cutoff = beforeMonth.getTime();
+    let totalRevenue = 0;
+    for (const entry of entries) {
+        if (entry.time < cutoff) totalRevenue += entry.revenue;
+    }
+
+    return totalRevenue;
 }
 
 // Helper: Get total budget
@@ -437,8 +486,15 @@ for (const [key, combo] of combinations) {
     const previousActuals = getPreviousActuals(combo.campaignId, combo.vendorId, combo.tactic, firstMonth);
     const previousActualsRounded = Math.round(previousActuals * 100) / 100;
 
-    // Calculate remaining budget after actuals
-    const remainingBudget = totalTacticVendorBudget - previousActuals;
+    // Revenue already recognised on closed months, on the same gross basis as the
+    // budget. This is what has actually been consumed - see getRecognisedRevenue.
+    const recognisedRevenue = getRecognisedRevenue(combo.campaignId, combo.vendorId, combo.tactic, firstMonth);
+
+    // Calculate remaining budget, floored at zero. An overspent combo used to drive
+    // this negative, which flowed straight through to Client Revenue, Estimated
+    // Vendor Cost and Forecasted Margin - a forecast cannot bill back a past
+    // overspend, so the remaining months are simply zero.
+    const remainingBudget = Math.max(0, totalTacticVendorBudget - recognisedRevenue);
 
     // PRE-CALCULATE: Days per month for ALL remaining months (calculated ONCE)
     const daysPerMonth = calculateDaysPerMonth(combo.deliverables, months);
@@ -504,10 +560,14 @@ for (const [key, combo] of combinations) {
             deliverableIds.push({id: deliverable.id});
         }
 
-        // Apply reweighting if there are previous actuals
+        // Apply reweighting once any revenue has been recognised on a closed month.
+        // Gated on recognisedRevenue rather than previousActuals: a month closed
+        // before its Actual Spend was entered has $0 spend but real recognised
+        // revenue, and skipping the reweight there is what let the budget be spread
+        // as though nothing had been delivered yet.
         let clientRevenue = baseClientRevenue;
 
-        if (previousActuals > 0 && totalRemainingDays > 0) {
+        if (recognisedRevenue > 0 && totalRemainingDays > 0) {
             // Get this month's days from pre-calculated map
             const thisMonthDays = daysPerMonth.get(monthKey(month)) || 0;
 
@@ -753,12 +813,53 @@ for (const slot of existingRecordsMap.values()) {
 
 console.log(`Duplicate warnings queued: ${duplicateWarningUpdates.length}`);
 
+// =========================================================================
+// MONTH CLOSE PASS: Flip Forecast rows whose month has fully ended over to Actual.
+//
+// The script previously had no month-close transition at all, so this was done by
+// hand every month. Two things made that costly: the main loop only looks at the
+// current month onwards, so a past row left as Forecast was never revisited again;
+// and a large manual edit is exactly where rows get missed or half-updated.
+//
+// Only Record Type is written. Actual Spend is deliberately left alone - what was
+// actually paid is finance's to enter, and guessing it here would be inventing
+// numbers. Until it is entered the row keeps its forecast Client Revenue, which is
+// the right estimate to carry and is already what the reweighting consumes.
+// =========================================================================
+const monthCloseUpdates = [];
+
+for (const [existingKey, slot] of existingRecordsMap) {
+    const record = slot.primary;
+
+    if (isActualRecord(record)) continue;
+    if (!activeCampaignIds.has(slot.resolvedCampaignId)) continue;
+
+    const recMonth = record.getCellValue("Month");
+    if (!recMonth) continue;
+
+    // Strictly before the current month, so a month still in progress is never
+    // closed early.
+    const monthDate = new Date(recMonth);
+    const rowMonthStart = new Date(monthDate.getUTCFullYear(), monthDate.getUTCMonth(), 1);
+    if (rowMonthStart >= currentMonth) continue;
+
+    monthCloseUpdates.push({
+        id: record.id,
+        fields: {
+            "Record Type": {name: "Actual"}
+        }
+    });
+}
+
+console.log(`Month close (Forecast -> Actual) queued: ${monthCloseUpdates.length}`);
+
 // Execute
 let created = 0;
 let updated = 0;
 let maintained = 0;
 let flagged = 0;
 let duplicatesFlagged = 0;
+let closed = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -800,7 +901,15 @@ if (duplicateWarningUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates flagged: ${duplicatesFlagged}`);
+if (monthCloseUpdates.length > 0) {
+    while (monthCloseUpdates.length > 0) {
+        const batch = monthCloseUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        closed += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates flagged: ${duplicatesFlagged}, Months closed: ${closed}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
@@ -808,5 +917,6 @@ if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsMaintained', maintained);
     output.set('recordsFlagged', flagged);
     output.set('duplicatesFlagged', duplicatesFlagged);
+    output.set('monthsClosed', closed);
     output.set('status', 'success');
 }
