@@ -30,6 +30,19 @@ function monthKey(date) {
     return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
+// Helper: Normalise a Tactic value to a trimmed string (or null).
+// Some Tactic values carry trailing spaces ("High Impact  "), and the combo key is
+// built from this text - so an untrimmed value silently forks a second parallel
+// monthly series for what is really the same tactic. Trimming on both the key side
+// and the write side keeps one series per tactic and stops the stale spaces from
+// being copied into Actualisation rows.
+function normaliseTactic(value) {
+    const text = value?.name || value;
+    if (typeof text !== "string") return text == null ? null : text;
+    const trimmed = text.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
 console.log(`Generating Forecast records from ${currentMonth.toLocaleDateString('en-US', {month: 'long', year: 'numeric'})} onwards`);
 
 // Load vendors and build Budget Category lookup
@@ -104,8 +117,7 @@ const deliverableInfoMap = new Map();
 for (const del of deliverableQuery.records) {
     const delCampaign = del.getCellValue(CONFIG.deliverableCampaignField);
     const delVendor = del.getCellValue(CONFIG.deliverableVendorField);
-    const delTacticRaw = del.getCellValue(CONFIG.deliverableTacticField);
-    const delTactic = delTacticRaw?.name || delTacticRaw;
+    const delTactic = normaliseTactic(del.getCellValue(CONFIG.deliverableTacticField));
 
     if (!delCampaign || !delVendor || !delTactic) continue;
 
@@ -132,8 +144,58 @@ const actualisationQuery = await actualisationTable.selectRecordsAsync({
 // "Previous Months Actual" silently loses everything recorded under the old label.
 // Falls back to the record's own fields when no linked deliverable resolves (e.g. it
 // was deleted) so historical rows with no surviving deliverable still get keyed.
+//
+// Each key maps to a SLOT, not a bare record. Re-deriving the key from live
+// deliverables means two rows created under different old labels can now land on
+// the same combo+month; a plain map.set() would silently drop all but the last,
+// leaving the others orphaned in the table while still counting toward rollups -
+// and, worse, hiding their Actual Spend from getPreviousActuals. The slot keeps
+// every colliding row: one primary (the row that carries recorded spend) plus
+// duplicates, which get flagged for a human rather than deleted.
 const existingRecordsMap = new Map();
 const unresolvedActiveForecastRecords = [];
+
+// Fields worth counting when deciding which of two colliding rows is more complete.
+const COMPLETENESS_FIELDS = [
+    "Client Revenue", "Estimated Vendor Cost", "Forecasted Margin $", "Actual Spend",
+    "Total Tactic/Vendor Budget", "Previous Months Actual", "Budget Category", "Deliverables"
+];
+
+function filledFieldCount(record) {
+    let filled = 0;
+    for (const field of COMPLETENESS_FIELDS) {
+        const value = record.getCellValue(field);
+        if (value == null) continue;
+        if (Array.isArray(value) && value.length === 0) continue;
+        if (typeof value === "number" && value === 0) continue;
+        filled++;
+    }
+    return filled;
+}
+
+// Actual Spend only counts when the row is actually marked Actual.
+function actualSpendOf(record) {
+    const recType = record.getCellValue("Record Type");
+    const recTypeText = recType?.name || recType;
+    if (recTypeText !== "Actual") return 0;
+    return record.getCellValue("Actual Spend") || 0;
+}
+
+// Rank two rows competing for the same combo+month slot. A row carrying recorded
+// Actual Spend always wins - dropping one is what silently corrupts Previous
+// Months Actual. Then prefer the more completely filled row, then fall back to
+// record id so the choice is deterministic across runs.
+function isBetterPrimary(candidate, current) {
+    const candidateSpend = Math.abs(actualSpendOf(candidate));
+    const currentSpend = Math.abs(actualSpendOf(current));
+    if ((candidateSpend > 0.01) !== (currentSpend > 0.01)) return candidateSpend > 0.01;
+
+    const candidateFilled = filledFieldCount(candidate);
+    const currentFilled = filledFieldCount(current);
+    if (candidateFilled !== currentFilled) return candidateFilled > currentFilled;
+
+    return candidate.id < current.id;
+}
 
 for (const record of actualisationQuery.records) {
     const recMonth = record.getCellValue("Month");
@@ -157,7 +219,7 @@ for (const record of actualisationQuery.records) {
     if (!resolvedViaLiveDeliverable) {
         const recCampaign = record.getCellValue("Campaign");
         const recVendor = record.getCellValue("Vendor");
-        const recTactic = record.getCellValue("Tactic");
+        const recTactic = normaliseTactic(record.getCellValue("Tactic"));
 
         if (!recCampaign || !recVendor) continue;
 
@@ -169,7 +231,21 @@ for (const record of actualisationQuery.records) {
     const monthDate = new Date(recMonth);
     const key = `${resolvedCampaignId}|${resolvedVendorId}|${resolvedTactic}|${monthKey(monthDate)}`;
 
-    existingRecordsMap.set(key, record);
+    const slot = existingRecordsMap.get(key);
+    if (!slot) {
+        existingRecordsMap.set(key, {
+            primary: record,
+            duplicates: [],
+            resolvedCampaignId: resolvedCampaignId,
+            resolvedVendorId: resolvedVendorId,
+            resolvedTactic: resolvedTactic
+        });
+    } else if (isBetterPrimary(record, slot.primary)) {
+        slot.duplicates.push(slot.primary);
+        slot.primary = record;
+    } else {
+        slot.duplicates.push(record);
+    }
 
     // Only worth flagging when the campaign is still active - a non-live campaign
     // naturally has no current deliverable to resolve against, and that's expected.
@@ -178,7 +254,27 @@ for (const record of actualisationQuery.records) {
     }
 }
 
-console.log(`Built lookup map with ${existingRecordsMap.size} existing records`);
+let duplicateRowCount = 0;
+for (const slot of existingRecordsMap.values()) duplicateRowCount += slot.duplicates.length;
+
+console.log(`Built lookup map with ${existingRecordsMap.size} combo+month slots covering ${existingRecordsMap.size + duplicateRowCount} existing records (${duplicateRowCount} duplicate rows)`);
+
+// Index Actual Spend by combo, built from slot PRIMARIES only. Summing every row
+// would double-count duplicates; summing a map that had silently dropped them lost
+// their spend entirely. Primaries are chosen to be the spend-carrying row, so this
+// both avoids double counting and stops losing recorded actuals.
+const actualsByCombo = new Map();
+for (const slot of existingRecordsMap.values()) {
+    const spend = actualSpendOf(slot.primary);
+    if (!spend) continue;
+
+    const recMonth = slot.primary.getCellValue("Month");
+    if (!recMonth) continue;
+
+    const comboKey = `${slot.resolvedCampaignId}|${slot.resolvedVendorId}|${slot.resolvedTactic}`;
+    if (!actualsByCombo.has(comboKey)) actualsByCombo.set(comboKey, []);
+    actualsByCombo.get(comboKey).push({time: new Date(recMonth).getTime(), spend: spend});
+}
 
 // Helper: Calculate days in month for a deliverable
 function getDaysInMonth(delStart, delEnd, monthStart, monthEnd) {
@@ -212,21 +308,13 @@ function calculateDeliverableBudget(deliverable, monthStart, monthEnd) {
 
 // Helper: Get previous actuals for reweighting
 function getPreviousActuals(campaignId, vendorId, tactic, beforeMonth) {
+    const entries = actualsByCombo.get(`${campaignId}|${vendorId}|${tactic}`);
+    if (!entries) return 0;
+
+    const cutoff = beforeMonth.getTime();
     let totalActuals = 0;
-
-    for (const [key, record] of existingRecordsMap) {
-        if (!key.startsWith(`${campaignId}|${vendorId}|${tactic}|`)) continue;
-
-        const recMonth = record.getCellValue("Month");
-        const recType = record.getCellValue("Record Type");
-        const actualSpend = record.getCellValue("Actual Spend");
-
-        const monthDate = new Date(recMonth);
-        const recTypeText = recType?.name || recType;
-
-        if (monthDate < beforeMonth && recTypeText === "Actual" && actualSpend) {
-            totalActuals += actualSpend;
-        }
+    for (const entry of entries) {
+        if (entry.time < cutoff) totalActuals += entry.spend;
     }
 
     return totalActuals;
@@ -303,10 +391,8 @@ for (const campaign of activeCampaigns) {
 
     for (const deliverable of campaignDeliverables) {
         const vendor = deliverable.getCellValue(CONFIG.deliverableVendorField);
-        const tacticRaw = deliverable.getCellValue(CONFIG.deliverableTacticField);
+        const tactic = normaliseTactic(deliverable.getCellValue(CONFIG.deliverableTacticField));
         const budget = deliverable.getCellValue(CONFIG.deliverableBudgetField);
-
-        const tactic = tacticRaw?.name || tacticRaw;
 
         if (!vendor || !tactic || !budget || budget === 0) continue;
 
@@ -369,7 +455,8 @@ for (const [key, combo] of combinations) {
         let warnings = [];
 
         const lookupKey = `${combo.campaignId}|${combo.vendorId}|${combo.tactic}|${monthKey(month)}`;
-        const existingRecord = existingRecordsMap.get(lookupKey);
+        const existingSlot = existingRecordsMap.get(lookupKey);
+        const existingRecord = existingSlot ? existingSlot.primary : undefined;
 
         // Skip if record is already marked as Actual
         // (Actuals are handled by the maintenance pass at the end of the script)
@@ -452,6 +539,13 @@ for (const [key, combo] of combinations) {
             const currentForecastedMargin = existingRecord.getCellValue("Forecasted Margin $") || 0;
             const currentBudgetCategory = existingRecord.getCellValue("Budget Category");
             const currentBudgetCategoryText = currentBudgetCategory?.name || currentBudgetCategory;
+            const currentVendorLink = existingRecord.getCellValue("Vendor");
+            const currentVendorId = currentVendorLink && currentVendorLink.length ? currentVendorLink[0].id : null;
+            // Compare the RAW stored text (not the normalised form) so a cell still
+            // holding "High Impact  " gets rewritten clean once. combo.tactic is already
+            // normalised, so after that single write the two match and this stops firing.
+            const currentTacticStored = existingRecord.getCellValue("Tactic");
+            const currentTacticText = currentTacticStored?.name || currentTacticStored;
             const currentTotalBudget = existingRecord.getCellValue("Total Tactic/Vendor Budget") || 0;
             const currentPreviousActuals = existingRecord.getCellValue("Previous Months Actual") || 0;
 
@@ -461,13 +555,24 @@ for (const [key, combo] of combinations) {
             const totalBudgetDiff = Math.abs(currentTotalBudget - totalTacticVendorBudgetRounded);
             const prevActualsDiff = Math.abs(currentPreviousActuals - monthPreviousActualsRounded);
 
+            // The row's own Vendor/Tactic cells are a snapshot from when it was written.
+            // We already re-key off the live deliverable so the row keeps matching after a
+            // deliverable is re-vendored or retagged - but unless we write the corrected
+            // labels back, the row keeps *displaying* the old vendor/tactic forever, which
+            // is what makes Actualisation disagree with Deliverables.
+            const vendorIsStale = currentVendorId !== combo.vendorId;
+            const tacticIsStale = (currentTacticText || null) !== (combo.tactic || null);
+
             // Update if any values changed
             if (revenueDiff > 0.01 || costDiff > 0.01 || marginDiff > 0.01 ||
                 currentBudgetCategoryText !== budgetCategory ||
-                totalBudgetDiff > 0.01 || prevActualsDiff > 0.01) {
+                totalBudgetDiff > 0.01 || prevActualsDiff > 0.01 ||
+                vendorIsStale || tacticIsStale) {
                 recordsToUpdate.push({
                     id: existingRecord.id,
                     fields: {
+                        "Vendor": [{id: combo.vendorId}],
+                        "Tactic": combo.tactic,
                         "Client Revenue": clientRevenue,
                         "Estimated Vendor Cost": estimatedVendorCostRounded,
                         "Forecasted Margin $": forecastedMarginRounded,
@@ -505,10 +610,14 @@ for (const [key, combo] of combinations) {
 console.log(`Records to create: ${recordsToCreate.length}, Records to update: ${recordsToUpdate.length}`);
 
 // =========================================================================
-// MAINTENANCE PASS: Update Total Tactic/Vendor Budget and Previous Months
-// Actual on existing Actual records (and any past Forecast records that the
-// main loop wouldn't touch). Only these two fields — never Record Type,
-// Actual Spend, Client Revenue, or any Forecast-specific field.
+// MAINTENANCE PASS: Re-sync Vendor/Tactic labels and update Total Tactic/Vendor
+// Budget and Previous Months Actual on existing Actual records (and any past
+// Forecast records that the main loop wouldn't touch). Only these fields — never
+// Record Type, Actual Spend, Client Revenue, or any Forecast-specific field.
+//
+// The Vendor/Tactic re-sync matters most here: the main loop skips Actual rows
+// entirely, so without this an actualised month keeps showing the vendor it was
+// booked under even after its deliverable moved to a different vendor.
 // =========================================================================
 const maintenanceUpdates = [];
 
@@ -517,8 +626,10 @@ for (const [comboKey, combo] of combinations) {
     const totalTacticVendorBudgetRounded = Math.round(totalTacticVendorBudget * 100) / 100;
     const comboPrefix = `${combo.campaignId}|${combo.vendorId}|${combo.tactic}|`;
 
-    for (const [existingKey, existingRecord] of existingRecordsMap) {
+    for (const [existingKey, slot] of existingRecordsMap) {
         if (!existingKey.startsWith(comboPrefix)) continue;
+
+        const existingRecord = slot.primary;
 
         const recMonth = existingRecord.getCellValue("Month");
         if (!recMonth) continue;
@@ -536,11 +647,21 @@ for (const [comboKey, combo] of combinations) {
         const totalBudgetDiff = Math.abs((currentTotalBudgetRaw || 0) - totalTacticVendorBudgetRounded);
         const prevActualsDiff = Math.abs((currentPreviousActualsRaw || 0) - monthPreviousActualsRounded);
 
+        const currentVendorLink = existingRecord.getCellValue("Vendor");
+        const currentVendorId = currentVendorLink && currentVendorLink.length ? currentVendorLink[0].id : null;
+        const currentTacticStored = existingRecord.getCellValue("Tactic");
+        const currentTacticText = currentTacticStored?.name || currentTacticStored;
+
+        const vendorIsStale = currentVendorId !== combo.vendorId;
+        const tacticIsStale = (currentTacticText || null) !== (combo.tactic || null);
+
         const needsUpdate =
             totalBudgetIsBlank ||
             prevActualsIsBlank ||
             totalBudgetDiff > 0.01 ||
-            prevActualsDiff > 0.01;
+            prevActualsDiff > 0.01 ||
+            vendorIsStale ||
+            tacticIsStale;
 
         if (!needsUpdate) continue;
 
@@ -551,6 +672,8 @@ for (const [comboKey, combo] of combinations) {
         maintenanceUpdates.push({
             id: existingRecord.id,
             fields: {
+                "Vendor": [{id: combo.vendorId}],
+                "Tactic": combo.tactic,
                 "Total Tactic/Vendor Budget": totalTacticVendorBudgetRounded,
                 "Previous Months Actual": monthPreviousActualsRounded
             }
@@ -591,11 +714,51 @@ for (const record of unresolvedActiveForecastRecords) {
 
 console.log(`Orphan warnings queued: ${orphanWarningUpdates.length}`);
 
+// =========================================================================
+// DUPLICATE WARNING PASS: Flag the non-primary rows in any combo+month slot that
+// ended up with more than one row. These are almost always left over from runs
+// made before the combo key was re-derived from live deliverables: the old row
+// was booked under a since-changed vendor/tactic, the run forked a new series,
+// and both now resolve to the same slot.
+//
+// Deliberately does NOT delete them - a row may carry Actual Spend a human still
+// needs to reconcile, and this script must never destroy recorded spend. It only
+// marks them so they can be merged by hand.
+// =========================================================================
+const DUPLICATE_WARNING = "Duplicate row for this Campaign/Vendor/Tactic/Month - another row is being treated as the source of truth and this one is excluded from Previous Months Actual. Merge any spend recorded here into the primary row, then delete this row.";
+const duplicateWarningUpdates = [];
+
+for (const slot of existingRecordsMap.values()) {
+    if (slot.duplicates.length === 0) continue;
+    if (!activeCampaignIds.has(slot.resolvedCampaignId)) continue;
+
+    for (const duplicate of slot.duplicates) {
+        const existingWarnings = duplicate.getCellValue("Data Warnings") || "";
+        if (existingWarnings.includes(DUPLICATE_WARNING)) continue;
+
+        const alreadyQueued =
+            recordsToUpdate.some(r => r.id === duplicate.id) ||
+            maintenanceUpdates.some(r => r.id === duplicate.id) ||
+            orphanWarningUpdates.some(r => r.id === duplicate.id);
+        if (alreadyQueued) continue;
+
+        duplicateWarningUpdates.push({
+            id: duplicate.id,
+            fields: {
+                "Data Warnings": existingWarnings ? `${existingWarnings}\n${DUPLICATE_WARNING}` : DUPLICATE_WARNING
+            }
+        });
+    }
+}
+
+console.log(`Duplicate warnings queued: ${duplicateWarningUpdates.length}`);
+
 // Execute
 let created = 0;
 let updated = 0;
 let maintained = 0;
 let flagged = 0;
+let duplicatesFlagged = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -629,12 +792,21 @@ if (orphanWarningUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}`);
+if (duplicateWarningUpdates.length > 0) {
+    while (duplicateWarningUpdates.length > 0) {
+        const batch = duplicateWarningUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        duplicatesFlagged += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates flagged: ${duplicatesFlagged}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
     output.set('recordsUpdated', updated);
     output.set('recordsMaintained', maintained);
     output.set('recordsFlagged', flagged);
+    output.set('duplicatesFlagged', duplicatesFlagged);
     output.set('status', 'success');
 }
