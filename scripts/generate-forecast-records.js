@@ -148,15 +148,22 @@ const unresolvedActiveRecords = [];
 // had its own row. Both rows still physically exist; only "kept" stays reachable
 // through existingRecordsMap and keeps getting maintained. Both get flagged below.
 const duplicateCombos = [];
-// Records whose OWN Campaign/Vendor/Tactic field(s) disagree with what their
-// linked Deliverable(s) actually resolve to. The rest of this script always
-// trusts the live-resolved value for matching/budgeting, but the record's own
-// field is what every view, report, and export reads directly - so a stale
-// field here is invisible everywhere except this warning. Causes seen in
-// practice: duplicating a Campaign (copies this table's Campaign link onto
-// the new duplicate without touching the Deliverables link), and editing a
-// Deliverable's Vendor/Tactic to a brand-new pairing after rows already exist.
-const fieldMismatches = [];
+// Records whose own Vendor and/or Tactic field disagrees with what their linked
+// Deliverable(s) actually resolve to (e.g. a Deliverable's Tactic select option
+// got retagged/corrected after rows already existed - a stale text/select
+// snapshot never picks that up on its own). Safe to self-heal: this only
+// rewrites the label, never Actual Spend, Client Revenue, or Record Type, so
+// it's queued for direct correction below rather than just a warning -
+// otherwise views/reports grouped on the record's own Tactic field stay split
+// into stale groups forever even after the underlying Deliverable is fixed.
+const vendorTacticAutoFixes = [];
+// Records whose own Campaign field disagrees with what their linked
+// Deliverable(s) actually resolve to. Unlike Vendor/Tactic, this is NOT
+// auto-corrected - it's usually caused by duplicating a Campaign (copies this
+// table's Campaign link onto the new duplicate without touching the
+// Deliverables link), and re-linking a record automatically could silently
+// move real Actual financial data under the wrong Campaign. Needs a human.
+const campaignMismatches = [];
 
 for (const record of actualisationQuery.records) {
     const recMonth = record.getCellValue("Month");
@@ -183,18 +190,22 @@ for (const record of actualisationQuery.records) {
     const recTacticOwn = recTacticRaw?.name || recTacticRaw;
 
     if (resolvedViaLiveDeliverable) {
-        const mismatches = [];
-        if (recCampaign && recCampaign[0].id !== resolvedCampaignId) {
-            mismatches.push({field: "Campaign", ownId: recCampaign[0].id, trueId: resolvedCampaignId});
-        }
+        const fixFields = {};
+        const fixDetails = [];
         if (recVendor && recVendor[0].id !== resolvedVendorId) {
-            mismatches.push({field: "Vendor", ownId: recVendor[0].id, trueId: resolvedVendorId});
+            fixFields["Vendor"] = [{id: resolvedVendorId}];
+            fixDetails.push({field: "Vendor", ownId: recVendor[0].id, trueId: resolvedVendorId});
         }
         if (recTacticOwn && recTacticOwn !== resolvedTactic) {
-            mismatches.push({field: "Tactic", ownText: recTacticOwn, trueText: resolvedTactic});
+            fixFields["Tactic"] = resolvedTactic;
+            fixDetails.push({field: "Tactic", ownText: recTacticOwn, trueText: resolvedTactic});
         }
-        if (mismatches.length > 0) {
-            fieldMismatches.push({record, mismatches});
+        if (Object.keys(fixFields).length > 0) {
+            vendorTacticAutoFixes.push({record, fixFields, fixDetails});
+        }
+
+        if (recCampaign && recCampaign[0].id !== resolvedCampaignId) {
+            campaignMismatches.push({record, ownCampaignId: recCampaign[0].id, trueCampaignId: resolvedCampaignId});
         }
     }
 
@@ -663,7 +674,11 @@ const duplicateComboUpdates = [];
 
 function queueDuplicateWarning(record, otherId, role, involvesActualData) {
     const existingWarnings = record.getCellValue("Data Warnings") || "";
-    if (existingWarnings.includes("DUPLICATE COMBO:")) return;
+    // Dedup on the SPECIFIC other record, not just the category label - a
+    // record can collide with a different record on a later run (e.g. after
+    // more retagging), and a stale note from a since-resolved collision must
+    // not suppress a brand-new one.
+    if (existingWarnings.includes(`DUPLICATE COMBO: record ${otherId} `)) return;
 
     const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) ||
         maintenanceUpdates.some(r => r.id === record.id) ||
@@ -706,46 +721,75 @@ for (const {kept, dropped} of duplicateCombos) {
 
 console.log(`Duplicate combo warnings queued: ${duplicateComboUpdates.length}`);
 
-// =========================================================================
-// FIELD MISMATCH WARNING PASS: Flag records whose own Campaign/Vendor/Tactic
-// field(s) disagree with what their linked Deliverable(s) resolve to. Never
-// auto-corrects the field - re-linking a record automatically could silently
-// move real Actual financial data under the wrong Campaign/Vendor/Tactic, so
-// this always needs a human to review and fix it.
-// =========================================================================
-const fieldMismatchUpdates = [];
-
 function nameForMismatch(field, id) {
     if (field === "Campaign") return campaignNameMap.get(id) || id;
     if (field === "Vendor") return vendorNameMap.get(id) || id;
     return id;
 }
 
-for (const {record, mismatches} of fieldMismatches) {
+// =========================================================================
+// VENDOR/TACTIC AUTO-FIX PASS: Rewrite a record's own Vendor and/or Tactic
+// field to match what its linked Deliverable(s) resolve to. This is the only
+// pass in the script that corrects a mismatch rather than just flagging it -
+// it's just a label (never Actual Spend/Client Revenue/Record Type), so
+// there's no financial data at risk, and leaving it stale is what causes a
+// corrected Deliverable Tactic (e.g. a typo/trailing-space fix) to still show
+// up as two disconnected groups in any view grouped on this table's own
+// Tactic/Vendor field.
+// =========================================================================
+const vendorTacticFixUpdates = [];
+
+for (const {record, fixFields, fixDetails} of vendorTacticAutoFixes) {
+    const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) ||
+        maintenanceUpdates.some(r => r.id === record.id) ||
+        vendorTacticFixUpdates.some(r => r.id === record.id);
+    if (alreadyQueued) continue;
+
+    vendorTacticFixUpdates.push({id: record.id, fields: fixFields});
+
+    for (const d of fixDetails) {
+        const ownLabel = d.field === "Tactic" ? d.ownText : nameForMismatch(d.field, d.ownId);
+        const trueLabel = d.field === "Tactic" ? d.trueText : nameForMismatch(d.field, d.trueId);
+        console.log(`Auto-fixing ${d.field} on ${record.id}: "${ownLabel}" -> "${trueLabel}"`);
+    }
+}
+
+console.log(`Vendor/Tactic auto-fixes queued: ${vendorTacticFixUpdates.length}`);
+
+// =========================================================================
+// CAMPAIGN MISMATCH WARNING PASS: Flag records whose own Campaign field
+// disagrees with what their linked Deliverable(s) resolve to. Never
+// auto-corrects the field - re-linking a record automatically could silently
+// move real Actual financial data under the wrong Campaign, so this always
+// needs a human to review and fix it.
+// =========================================================================
+const campaignMismatchUpdates = [];
+
+for (const {record, ownCampaignId, trueCampaignId} of campaignMismatches) {
     const existingWarnings = record.getCellValue("Data Warnings") || "";
-    if (existingWarnings.includes("FIELD MISMATCH:")) continue;
+
+    const ownLabel = nameForMismatch("Campaign", ownCampaignId);
+    const trueLabel = nameForMismatch("Campaign", trueCampaignId);
+    let note = `CAMPAIGN MISMATCH: Campaign says "${ownLabel}" but its linked Deliverable(s) say "${trueLabel}". This usually happens when a Campaign was duplicated, which copies this table's Campaign link onto the new duplicate without moving the Deliverables link. `;
+    if (isActualOrHasSpend(record)) {
+        note += "This record has Actual Record Type or Actual Spend - DO NOT DELETE. Please manually review and correct the Campaign field.";
+    } else {
+        note += "Please review and correct the Campaign field to match the linked Deliverable(s).";
+    }
+
+    // Dedup on the exact note - a record can genuinely flip to a different
+    // wrong-Campaign mismatch on a later run, and a stale note from a
+    // since-resolved mismatch must not suppress a brand-new one.
+    if (existingWarnings.includes(note)) continue;
 
     const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) ||
         maintenanceUpdates.some(r => r.id === record.id) ||
         orphanWarningUpdates.some(r => r.id === record.id) ||
         duplicateComboUpdates.some(r => r.id === record.id) ||
-        fieldMismatchUpdates.some(r => r.id === record.id);
+        campaignMismatchUpdates.some(r => r.id === record.id);
     if (alreadyQueued) continue;
 
-    const details = mismatches.map(m => {
-        const ownLabel = m.field === "Tactic" ? m.ownText : nameForMismatch(m.field, m.ownId);
-        const trueLabel = m.field === "Tactic" ? m.trueText : nameForMismatch(m.field, m.trueId);
-        return `${m.field} says "${ownLabel}" but its linked Deliverable(s) say "${trueLabel}"`;
-    }).join("; ");
-
-    let note = `FIELD MISMATCH: ${details}. This usually happens when a Campaign was duplicated (which copies this table's links onto the new duplicate without moving the Deliverables link) or a Deliverable's Vendor/Tactic was edited after this row was created. `;
-    if (isActualOrHasSpend(record)) {
-        note += "This record has Actual Record Type or Actual Spend - DO NOT DELETE. Please manually review and correct the field(s) above.";
-    } else {
-        note += "Please review and correct the field(s) above to match the linked Deliverable(s).";
-    }
-
-    fieldMismatchUpdates.push({
+    campaignMismatchUpdates.push({
         id: record.id,
         fields: {
             "Data Warnings": existingWarnings ? `${existingWarnings}\n${note}` : note
@@ -753,7 +797,7 @@ for (const {record, mismatches} of fieldMismatches) {
     });
 }
 
-console.log(`Field mismatch warnings queued: ${fieldMismatchUpdates.length}`);
+console.log(`Campaign mismatch warnings queued: ${campaignMismatchUpdates.length}`);
 
 // Execute
 let created = 0;
@@ -761,7 +805,8 @@ let updated = 0;
 let maintained = 0;
 let flagged = 0;
 let duplicatesFlagged = 0;
-let mismatchesFlagged = 0;
+let vendorTacticFixed = 0;
+let campaignMismatchesFlagged = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -803,22 +848,31 @@ if (duplicateComboUpdates.length > 0) {
     }
 }
 
-if (fieldMismatchUpdates.length > 0) {
-    while (fieldMismatchUpdates.length > 0) {
-        const batch = fieldMismatchUpdates.splice(0, 50);
+if (vendorTacticFixUpdates.length > 0) {
+    while (vendorTacticFixUpdates.length > 0) {
+        const batch = vendorTacticFixUpdates.splice(0, 50);
         await actualisationTable.updateRecordsAsync(batch);
-        mismatchesFlagged += batch.length;
+        vendorTacticFixed += batch.length;
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Mismatches Flagged: ${mismatchesFlagged}`);
+if (campaignMismatchUpdates.length > 0) {
+    while (campaignMismatchUpdates.length > 0) {
+        const batch = campaignMismatchUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        campaignMismatchesFlagged += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Vendor/Tactic Fixed: ${vendorTacticFixed}, Campaign Mismatches Flagged: ${campaignMismatchesFlagged}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
     output.set('recordsUpdated', updated);
     output.set('recordsMaintained', maintained);
     output.set('recordsDuplicatesFlagged', duplicatesFlagged);
-    output.set('recordsMismatchesFlagged', mismatchesFlagged);
+    output.set('recordsVendorTacticFixed', vendorTacticFixed);
+    output.set('recordsCampaignMismatchesFlagged', campaignMismatchesFlagged);
     output.set('recordsFlagged', flagged);
     output.set('status', 'success');
 }
