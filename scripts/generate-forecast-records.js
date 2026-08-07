@@ -38,10 +38,12 @@ const vendorQuery = await vendorsTable.selectRecordsAsync({
 });
 
 const vendorBudgetCategoryMap = new Map();
+const vendorNameMap = new Map();
 for (const vendor of vendorQuery.records) {
     const budgetCat = vendor.getCellValue(CONFIG.vendorBudgetCategoryField);
     const budgetCatText = budgetCat?.name || budgetCat || null;
     vendorBudgetCategoryMap.set(vendor.id, budgetCatText);
+    vendorNameMap.set(vendor.id, vendor.name);
 }
 
 console.log(`Loaded ${vendorBudgetCategoryMap.size} vendors with Budget Categories`);
@@ -73,6 +75,13 @@ console.log(`Found ${activeCampaigns.length} active campaigns`);
 
 // Create a Set of active campaign IDs for fast lookup
 const activeCampaignIds = new Set(activeCampaigns.map(c => c.id));
+
+// Name lookup for every campaign (not just active ones) - used to make the
+// Campaign Mismatch warning below human-readable.
+const campaignNameMap = new Map();
+for (const c of campaignQuery.records) {
+    campaignNameMap.set(c.id, c.name);
+}
 
 // Get only deliverables for active campaigns
 const deliverableQuery = await deliverablesTable.selectRecordsAsync({
@@ -139,6 +148,15 @@ const unresolvedActiveRecords = [];
 // had its own row. Both rows still physically exist; only "kept" stays reachable
 // through existingRecordsMap and keeps getting maintained. Both get flagged below.
 const duplicateCombos = [];
+// Records whose OWN Campaign/Vendor/Tactic field(s) disagree with what their
+// linked Deliverable(s) actually resolve to. The rest of this script always
+// trusts the live-resolved value for matching/budgeting, but the record's own
+// field is what every view, report, and export reads directly - so a stale
+// field here is invisible everywhere except this warning. Causes seen in
+// practice: duplicating a Campaign (copies this table's Campaign link onto
+// the new duplicate without touching the Deliverables link), and editing a
+// Deliverable's Vendor/Tactic to a brand-new pairing after rows already exist.
+const fieldMismatches = [];
 
 for (const record of actualisationQuery.records) {
     const recMonth = record.getCellValue("Month");
@@ -159,16 +177,33 @@ for (const record of actualisationQuery.records) {
 
     const resolvedViaLiveDeliverable = Boolean(resolvedCampaignId && resolvedVendorId);
 
-    if (!resolvedViaLiveDeliverable) {
-        const recCampaign = record.getCellValue("Campaign");
-        const recVendor = record.getCellValue("Vendor");
-        const recTactic = record.getCellValue("Tactic");
+    const recCampaign = record.getCellValue("Campaign");
+    const recVendor = record.getCellValue("Vendor");
+    const recTacticRaw = record.getCellValue("Tactic");
+    const recTacticOwn = recTacticRaw?.name || recTacticRaw;
 
+    if (resolvedViaLiveDeliverable) {
+        const mismatches = [];
+        if (recCampaign && recCampaign[0].id !== resolvedCampaignId) {
+            mismatches.push({field: "Campaign", ownId: recCampaign[0].id, trueId: resolvedCampaignId});
+        }
+        if (recVendor && recVendor[0].id !== resolvedVendorId) {
+            mismatches.push({field: "Vendor", ownId: recVendor[0].id, trueId: resolvedVendorId});
+        }
+        if (recTacticOwn && recTacticOwn !== resolvedTactic) {
+            mismatches.push({field: "Tactic", ownText: recTacticOwn, trueText: resolvedTactic});
+        }
+        if (mismatches.length > 0) {
+            fieldMismatches.push({record, mismatches});
+        }
+    }
+
+    if (!resolvedViaLiveDeliverable) {
         if (!recCampaign || !recVendor) continue;
 
         resolvedCampaignId = recCampaign[0].id;
         resolvedVendorId = recVendor[0].id;
-        resolvedTactic = recTactic;
+        resolvedTactic = recTacticOwn;
     }
 
     const monthDate = new Date(recMonth);
@@ -671,12 +706,62 @@ for (const {kept, dropped} of duplicateCombos) {
 
 console.log(`Duplicate combo warnings queued: ${duplicateComboUpdates.length}`);
 
+// =========================================================================
+// FIELD MISMATCH WARNING PASS: Flag records whose own Campaign/Vendor/Tactic
+// field(s) disagree with what their linked Deliverable(s) resolve to. Never
+// auto-corrects the field - re-linking a record automatically could silently
+// move real Actual financial data under the wrong Campaign/Vendor/Tactic, so
+// this always needs a human to review and fix it.
+// =========================================================================
+const fieldMismatchUpdates = [];
+
+function nameForMismatch(field, id) {
+    if (field === "Campaign") return campaignNameMap.get(id) || id;
+    if (field === "Vendor") return vendorNameMap.get(id) || id;
+    return id;
+}
+
+for (const {record, mismatches} of fieldMismatches) {
+    const existingWarnings = record.getCellValue("Data Warnings") || "";
+    if (existingWarnings.includes("FIELD MISMATCH:")) continue;
+
+    const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) ||
+        maintenanceUpdates.some(r => r.id === record.id) ||
+        orphanWarningUpdates.some(r => r.id === record.id) ||
+        duplicateComboUpdates.some(r => r.id === record.id) ||
+        fieldMismatchUpdates.some(r => r.id === record.id);
+    if (alreadyQueued) continue;
+
+    const details = mismatches.map(m => {
+        const ownLabel = m.field === "Tactic" ? m.ownText : nameForMismatch(m.field, m.ownId);
+        const trueLabel = m.field === "Tactic" ? m.trueText : nameForMismatch(m.field, m.trueId);
+        return `${m.field} says "${ownLabel}" but its linked Deliverable(s) say "${trueLabel}"`;
+    }).join("; ");
+
+    let note = `FIELD MISMATCH: ${details}. This usually happens when a Campaign was duplicated (which copies this table's links onto the new duplicate without moving the Deliverables link) or a Deliverable's Vendor/Tactic was edited after this row was created. `;
+    if (isActualOrHasSpend(record)) {
+        note += "This record has Actual Record Type or Actual Spend - DO NOT DELETE. Please manually review and correct the field(s) above.";
+    } else {
+        note += "Please review and correct the field(s) above to match the linked Deliverable(s).";
+    }
+
+    fieldMismatchUpdates.push({
+        id: record.id,
+        fields: {
+            "Data Warnings": existingWarnings ? `${existingWarnings}\n${note}` : note
+        }
+    });
+}
+
+console.log(`Field mismatch warnings queued: ${fieldMismatchUpdates.length}`);
+
 // Execute
 let created = 0;
 let updated = 0;
 let maintained = 0;
 let flagged = 0;
 let duplicatesFlagged = 0;
+let mismatchesFlagged = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -718,13 +803,22 @@ if (duplicateComboUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}`);
+if (fieldMismatchUpdates.length > 0) {
+    while (fieldMismatchUpdates.length > 0) {
+        const batch = fieldMismatchUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        mismatchesFlagged += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Mismatches Flagged: ${mismatchesFlagged}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
     output.set('recordsUpdated', updated);
     output.set('recordsMaintained', maintained);
     output.set('recordsDuplicatesFlagged', duplicatesFlagged);
+    output.set('recordsMismatchesFlagged', mismatchesFlagged);
     output.set('recordsFlagged', flagged);
     output.set('status', 'success');
 }
