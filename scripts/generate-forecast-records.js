@@ -93,7 +93,10 @@ const deliverableQuery = await deliverablesTable.selectRecordsAsync({
         CONFIG.deliverableEndField,
         CONFIG.deliverableBudgetField,
         CONFIG.deliverableMarginField,
-        "Deliverable ID"
+        "Deliverable ID",
+        "Total Actualised",
+        "Actualised Lock Snapshot",
+        "Deliverable Warnings"
     ]
 });
 
@@ -124,6 +127,106 @@ for (const del of deliverableQuery.records) {
         tactic: delTactic
     });
 }
+
+// =========================================================================
+// ACTUALISED DELIVERABLE LOCK PASS: Once a deliverable has real Actual spend
+// recorded against it (via the existing "Total Actualised" rollup), freeze a
+// snapshot of its Campaign/Vendor/Tactic/Budget. On every later run, compare
+// the live values against that frozen snapshot - if they differ, someone
+// edited the deliverable AFTER it was actualised. That's dangerous because
+// this script resolves everything through the live deliverable: editing it
+// silently relabels/reweights historical Actual rows instead of just future
+// Forecast ones. The correct process is to zero out this deliverable's
+// budget and create a new one for the change - this pass only warns, it
+// never blocks or reverts anything.
+//
+// Scope: compares Campaign/Vendor/Tactic/Budget only (not dates - changing a
+// deliverable's dates alone doesn't retroactively touch Actual Spend, Client
+// Revenue, or Total Tactic/Vendor Budget on already-Actual rows). Also
+// per-deliverable, not per-combo: if a *different* deliverable in the same
+// Campaign+Vendor+Tactic group already has Actual spend, editing THIS one
+// still isn't caught here.
+// =========================================================================
+function deliverableSnapshot(del) {
+    const delCampaign = del.getCellValue(CONFIG.deliverableCampaignField);
+    const delVendor = del.getCellValue(CONFIG.deliverableVendorField);
+    const delTacticRaw = del.getCellValue(CONFIG.deliverableTacticField);
+    const delTactic = delTacticRaw?.name || delTacticRaw;
+    const delBudget = del.getCellValue(CONFIG.deliverableBudgetField) || 0;
+
+    return {
+        campaignId: delCampaign ? delCampaign[0].id : null,
+        campaignName: delCampaign ? delCampaign[0].name : "(none)",
+        vendorId: delVendor ? delVendor[0].id : null,
+        vendorName: delVendor ? delVendor[0].name : "(none)",
+        tactic: delTactic || "(none)",
+        budget: Math.round(delBudget * 100) / 100
+    };
+}
+
+function snapshotKey(s) {
+    return `${s.campaignId}|${s.vendorId}|${s.tactic}|${s.budget}`;
+}
+
+function snapshotDiffSummary(oldParts, newSnap) {
+    const [oldCampaignId, oldVendorId, oldTactic, oldBudget] = oldParts;
+    const changes = [];
+    if (oldCampaignId !== newSnap.campaignId) {
+        changes.push(`Campaign was "${campaignNameMap.get(oldCampaignId) || oldCampaignId}", now "${newSnap.campaignName}"`);
+    }
+    if (oldVendorId !== newSnap.vendorId) {
+        changes.push(`Vendor was "${vendorNameMap.get(oldVendorId) || oldVendorId}", now "${newSnap.vendorName}"`);
+    }
+    if (oldTactic !== newSnap.tactic) {
+        changes.push(`Tactic was "${oldTactic}", now "${newSnap.tactic}"`);
+    }
+    if (oldBudget !== String(newSnap.budget)) {
+        changes.push(`Planned Budget was $${oldBudget}, now $${newSnap.budget}`);
+    }
+    return changes.join("; ");
+}
+
+const deliverableLockUpdates = [];
+
+for (const del of deliverableQuery.records) {
+    const totalActualised = del.getCellValue("Total Actualised") || 0;
+    if (totalActualised <= 0) continue;
+
+    const currentSnapshot = deliverableSnapshot(del);
+    const currentKey = snapshotKey(currentSnapshot);
+    const lockedKey = del.getCellValue("Actualised Lock Snapshot");
+
+    if (!lockedKey) {
+        // First time we see actuals against this deliverable - freeze the baseline.
+        deliverableLockUpdates.push({
+            id: del.id,
+            fields: {"Actualised Lock Snapshot": currentKey}
+        });
+        continue;
+    }
+
+    if (lockedKey === currentKey) continue;
+
+    const diffSummary = snapshotDiffSummary(lockedKey.split("|"), currentSnapshot);
+    const deliverableName = del.getCellValueAsString("Deliverable ID") || del.id;
+    const note = `ACTUALISED DELIVERABLE CHANGED: This deliverable has $${totalActualised} in Actual spend recorded against it, but was edited afterwards - ${diffSummary}. Editing a deliverable after it's been actualised can silently relabel/reweight historical Actual records. Please revert this change and create a NEW deliverable to carry it instead.`;
+
+    const existingWarnings = del.getCellValue("Deliverable Warnings") || "";
+    deliverableLockUpdates.push({
+        id: del.id,
+        fields: {
+            "Deliverable Warnings": existingWarnings ? `${existingWarnings}\n${note}` : note,
+            // Re-baseline to the new state so next run compares against THIS
+            // change going forward, rather than re-flagging the same drift
+            // (and the same instant/original edit) forever.
+            "Actualised Lock Snapshot": currentKey
+        }
+    });
+
+    console.log(`Deliverable ${deliverableName} (${del.id}) edited after actualisation: ${diffSummary}`);
+}
+
+console.log(`Deliverable lock updates queued: ${deliverableLockUpdates.length}`);
 
 // Get existing actualisation records
 const actualisationQuery = await actualisationTable.selectRecordsAsync({
@@ -807,6 +910,7 @@ let flagged = 0;
 let duplicatesFlagged = 0;
 let vendorTacticFixed = 0;
 let campaignMismatchesFlagged = 0;
+let deliverablesLocked = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -864,7 +968,15 @@ if (campaignMismatchUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Vendor/Tactic Fixed: ${vendorTacticFixed}, Campaign Mismatches Flagged: ${campaignMismatchesFlagged}`);
+if (deliverableLockUpdates.length > 0) {
+    while (deliverableLockUpdates.length > 0) {
+        const batch = deliverableLockUpdates.splice(0, 50);
+        await deliverablesTable.updateRecordsAsync(batch);
+        deliverablesLocked += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Vendor/Tactic Fixed: ${vendorTacticFixed}, Campaign Mismatches Flagged: ${campaignMismatchesFlagged}, Deliverable Lock Updates: ${deliverablesLocked}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
@@ -874,5 +986,6 @@ if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsVendorTacticFixed', vendorTacticFixed);
     output.set('recordsCampaignMismatchesFlagged', campaignMismatchesFlagged);
     output.set('recordsFlagged', flagged);
+    output.set('deliverablesLockUpdated', deliverablesLocked);
     output.set('status', 'success');
 }
