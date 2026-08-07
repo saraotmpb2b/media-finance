@@ -134,6 +134,11 @@ const actualisationQuery = await actualisationTable.selectRecordsAsync({
 // was deleted) so historical rows with no surviving deliverable still get keyed.
 const existingRecordsMap = new Map();
 const unresolvedActiveForecastRecords = [];
+// Pairs of {kept, dropped} where two live records resolved to the identical combo
+// key - e.g. a deliverable's Vendor/Tactic changed to match a combo that already
+// had its own row. Both rows still physically exist; only "kept" stays reachable
+// through existingRecordsMap and keeps getting maintained. Both get flagged below.
+const duplicateCombos = [];
 
 for (const record of actualisationQuery.records) {
     const recMonth = record.getCellValue("Month");
@@ -169,7 +174,30 @@ for (const record of actualisationQuery.records) {
     const monthDate = new Date(recMonth);
     const key = `${resolvedCampaignId}|${resolvedVendorId}|${resolvedTactic}|${monthKey(monthDate)}`;
 
-    existingRecordsMap.set(key, record);
+    const priorRecord = existingRecordsMap.get(key);
+
+    if (!priorRecord) {
+        existingRecordsMap.set(key, record);
+    } else {
+        // Collision: never let an Actual row become unreachable - real spend data
+        // must never silently drop out of maintenance. If both are Actual, keep
+        // whichever was already there; that's a genuine conflict needing human
+        // review either way, not something safe to auto-resolve.
+        const priorType = priorRecord.getCellValue("Record Type");
+        const priorTypeText = priorType?.name || priorType;
+        const recType = record.getCellValue("Record Type");
+        const recTypeText = recType?.name || recType;
+
+        let kept = priorRecord;
+        let dropped = record;
+        if (priorTypeText !== "Actual" && recTypeText === "Actual") {
+            kept = record;
+            dropped = priorRecord;
+            existingRecordsMap.set(key, record);
+        }
+
+        duplicateCombos.push({kept, dropped});
+    }
 
     // Only worth flagging when the campaign is still active - a non-live campaign
     // naturally has no current deliverable to resolve against, and that's expected.
@@ -179,6 +207,7 @@ for (const record of actualisationQuery.records) {
 }
 
 console.log(`Built lookup map with ${existingRecordsMap.size} existing records`);
+console.log(`Duplicate combos detected: ${duplicateCombos.length}`);
 
 // Helper: Calculate days in month for a deliverable
 function getDaysInMonth(delStart, delEnd, monthStart, monthEnd) {
@@ -591,11 +620,55 @@ for (const record of unresolvedActiveForecastRecords) {
 
 console.log(`Orphan warnings queued: ${orphanWarningUpdates.length}`);
 
+// =========================================================================
+// DUPLICATE COMBO WARNING PASS: Flag both sides of a collision detected while
+// building existingRecordsMap above - two real records that now resolve to
+// the same Campaign/Vendor/Tactic/Month combo (typically a deliverable's
+// Vendor/Tactic was edited to match a combo that already had its own row).
+// Only one of the two stays reachable by the rest of this script; the other
+// is a genuine duplicate that needs a human to merge or delete it.
+// =========================================================================
+const duplicateComboUpdates = [];
+
+function queueDuplicateWarning(record, otherId, role) {
+    const recType = record.getCellValue("Record Type");
+    const recTypeText = recType?.name || recType;
+    if (recTypeText !== "Forecast") return;
+
+    const existingWarnings = record.getCellValue("Data Warnings") || "";
+    if (existingWarnings.includes("DUPLICATE COMBO:")) return;
+
+    const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) ||
+        maintenanceUpdates.some(r => r.id === record.id) ||
+        orphanWarningUpdates.some(r => r.id === record.id) ||
+        duplicateComboUpdates.some(r => r.id === record.id);
+    if (alreadyQueued) return;
+
+    const note = role === "kept"
+        ? `DUPLICATE COMBO: record ${otherId} resolves to the same Campaign/Vendor/Tactic/Month combo as this one (likely a deliverable's Vendor/Tactic was changed to match an already-existing series). This record is being kept and maintained going forward; the other one is now stale. Please review and merge/delete the duplicate.`
+        : `DUPLICATE COMBO: record ${otherId} now resolves to the same Campaign/Vendor/Tactic/Month combo as this one (likely a deliverable's Vendor/Tactic was changed to match an already-existing series). This record is no longer being updated by the forecast script - Total Tactic/Vendor Budget and Previous Months Actual here are frozen/stale. Please review and merge into the other record, then delete this one.`;
+
+    duplicateComboUpdates.push({
+        id: record.id,
+        fields: {
+            "Data Warnings": existingWarnings ? `${existingWarnings}\n${note}` : note
+        }
+    });
+}
+
+for (const {kept, dropped} of duplicateCombos) {
+    queueDuplicateWarning(kept, dropped.id, "kept");
+    queueDuplicateWarning(dropped, kept.id, "dropped");
+}
+
+console.log(`Duplicate combo warnings queued: ${duplicateComboUpdates.length}`);
+
 // Execute
 let created = 0;
 let updated = 0;
 let maintained = 0;
 let flagged = 0;
+let duplicatesFlagged = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -629,12 +702,21 @@ if (orphanWarningUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}`);
+if (duplicateComboUpdates.length > 0) {
+    while (duplicateComboUpdates.length > 0) {
+        const batch = duplicateComboUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        duplicatesFlagged += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
     output.set('recordsUpdated', updated);
     output.set('recordsMaintained', maintained);
+    output.set('recordsDuplicatesFlagged', duplicatesFlagged);
     output.set('recordsFlagged', flagged);
     output.set('status', 'success');
 }
