@@ -133,7 +133,7 @@ const actualisationQuery = await actualisationTable.selectRecordsAsync({
 // Falls back to the record's own fields when no linked deliverable resolves (e.g. it
 // was deleted) so historical rows with no surviving deliverable still get keyed.
 const existingRecordsMap = new Map();
-const unresolvedActiveForecastRecords = [];
+const unresolvedActiveRecords = [];
 // Pairs of {kept, dropped} where two live records resolved to the identical combo
 // key - e.g. a deliverable's Vendor/Tactic changed to match a combo that already
 // had its own row. Both rows still physically exist; only "kept" stays reachable
@@ -202,7 +202,7 @@ for (const record of actualisationQuery.records) {
     // Only worth flagging when the campaign is still active - a non-live campaign
     // naturally has no current deliverable to resolve against, and that's expected.
     if (!resolvedViaLiveDeliverable && activeCampaignIds.has(resolvedCampaignId)) {
-        unresolvedActiveForecastRecords.push(record);
+        unresolvedActiveRecords.push(record);
     }
 }
 
@@ -599,11 +599,7 @@ console.log(`Maintenance updates queued: ${maintenanceUpdates.length}`);
 const ORPHAN_WARNING = "No live deliverable could be matched to this record (it may have been deleted or reassigned) - Total Tactic/Vendor Budget and Previous Months Actual may be stale. Please review.";
 const orphanWarningUpdates = [];
 
-for (const record of unresolvedActiveForecastRecords) {
-    const recType = record.getCellValue("Record Type");
-    const recTypeText = recType?.name || recType;
-    if (recTypeText !== "Forecast") continue;
-
+for (const record of unresolvedActiveRecords) {
     const existingWarnings = record.getCellValue("Data Warnings") || "";
     if (existingWarnings.includes(ORPHAN_WARNING)) continue;
 
@@ -630,11 +626,7 @@ console.log(`Orphan warnings queued: ${orphanWarningUpdates.length}`);
 // =========================================================================
 const duplicateComboUpdates = [];
 
-function queueDuplicateWarning(record, otherId, role) {
-    const recType = record.getCellValue("Record Type");
-    const recTypeText = recType?.name || recType;
-    if (recTypeText !== "Forecast") return;
-
+function queueDuplicateWarning(record, otherId, role, involvesActualData) {
     const existingWarnings = record.getCellValue("Data Warnings") || "";
     if (existingWarnings.includes("DUPLICATE COMBO:")) return;
 
@@ -644,9 +636,17 @@ function queueDuplicateWarning(record, otherId, role) {
         duplicateComboUpdates.some(r => r.id === record.id);
     if (alreadyQueued) return;
 
-    const note = role === "kept"
-        ? `DUPLICATE COMBO: record ${otherId} resolves to the same Campaign/Vendor/Tactic/Month combo as this one (likely a deliverable's Vendor/Tactic was changed to match an already-existing series). This record is being kept and maintained going forward; the other one is now stale. Please review and merge/delete the duplicate.`
-        : `DUPLICATE COMBO: record ${otherId} now resolves to the same Campaign/Vendor/Tactic/Month combo as this one (likely a deliverable's Vendor/Tactic was changed to match an already-existing series). This record is no longer being updated by the forecast script - Total Tactic/Vendor Budget and Previous Months Actual here are frozen/stale. Please review and merge into the other record, then delete this one.`;
+    // Real spend/revenue is on one or both sides - deleting either record could
+    // silently destroy real financial history, so never suggest that here. This
+    // needs a human to reconcile the numbers, not a delete.
+    let note;
+    if (involvesActualData) {
+        note = `DUPLICATE COMBO: record ${otherId} resolves to the same Campaign/Vendor/Tactic/Month combo as this one, and at least one side has Actual Record Type or Actual Spend - DO NOT DELETE either record. Please manually review both records' Actual Spend and Client Revenue and reconcile them.`;
+    } else if (role === "kept") {
+        note = `DUPLICATE COMBO: record ${otherId} resolves to the same Campaign/Vendor/Tactic/Month combo as this one (likely a deliverable's Vendor/Tactic was changed to match an already-existing series). This record is being kept and maintained going forward; the other one is now stale. Please review and merge/delete the duplicate.`;
+    } else {
+        note = `DUPLICATE COMBO: record ${otherId} now resolves to the same Campaign/Vendor/Tactic/Month combo as this one (likely a deliverable's Vendor/Tactic was changed to match an already-existing series). This record is no longer being updated by the forecast script - Total Tactic/Vendor Budget and Previous Months Actual here are frozen/stale. Please review and merge into the other record, then delete this one.`;
+    }
 
     duplicateComboUpdates.push({
         id: record.id,
@@ -656,9 +656,17 @@ function queueDuplicateWarning(record, otherId, role) {
     });
 }
 
+function isActualOrHasSpend(record) {
+    const recType = record.getCellValue("Record Type");
+    const recTypeText = recType?.name || recType;
+    const actualSpend = record.getCellValue("Actual Spend");
+    return recTypeText === "Actual" || Boolean(actualSpend);
+}
+
 for (const {kept, dropped} of duplicateCombos) {
-    queueDuplicateWarning(kept, dropped.id, "kept");
-    queueDuplicateWarning(dropped, kept.id, "dropped");
+    const involvesActualData = isActualOrHasSpend(kept) || isActualOrHasSpend(dropped);
+    queueDuplicateWarning(kept, dropped.id, "kept", involvesActualData);
+    queueDuplicateWarning(dropped, kept.id, "dropped", involvesActualData);
 }
 
 console.log(`Duplicate combo warnings queued: ${duplicateComboUpdates.length}`);
