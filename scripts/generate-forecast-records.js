@@ -902,6 +902,43 @@ for (const {record, ownCampaignId, trueCampaignId} of campaignMismatches) {
 
 console.log(`Campaign mismatch warnings queued: ${campaignMismatchUpdates.length}`);
 
+// =========================================================================
+// MISSING DELIVERABLE LINK ERROR PASS: Flag any Monthly Actualisation record
+// with no Deliverable linked at all - any Record Type, any Campaign, active
+// or not. This is a stricter, unconditional check than the Orphan Warning
+// pass above, which only covers still-active campaigns and only catches
+// combos that fail to resolve (not necessarily an empty link). Actual Spend
+// or Client Revenue that can't trace back to any Deliverable is a data-
+// integrity error on its own, independent of whether the campaign is live.
+// =========================================================================
+const MISSING_DELIVERABLE_ERROR = "ERROR: No Deliverable is linked to this record. Its Actual Spend/Client Revenue cannot be traced to any Deliverable - please link one or investigate how this record was created.";
+const missingDeliverableUpdates = [];
+
+for (const record of actualisationQuery.records) {
+    const linkedDeliverables = record.getCellValue("Deliverables");
+    if (linkedDeliverables && linkedDeliverables.length > 0) continue;
+
+    const existingWarnings = record.getCellValue("Data Warnings") || "";
+    if (existingWarnings.includes(MISSING_DELIVERABLE_ERROR)) continue;
+
+    const alreadyQueued = recordsToUpdate.some(r => r.id === record.id) ||
+        maintenanceUpdates.some(r => r.id === record.id) ||
+        orphanWarningUpdates.some(r => r.id === record.id) ||
+        duplicateComboUpdates.some(r => r.id === record.id) ||
+        campaignMismatchUpdates.some(r => r.id === record.id) ||
+        missingDeliverableUpdates.some(r => r.id === record.id);
+    if (alreadyQueued) continue;
+
+    missingDeliverableUpdates.push({
+        id: record.id,
+        fields: {
+            "Data Warnings": existingWarnings ? `${existingWarnings}\n${MISSING_DELIVERABLE_ERROR}` : MISSING_DELIVERABLE_ERROR
+        }
+    });
+}
+
+console.log(`Missing-deliverable-link errors queued: ${missingDeliverableUpdates.length}`);
+
 // Execute
 let created = 0;
 let updated = 0;
@@ -911,6 +948,7 @@ let duplicatesFlagged = 0;
 let vendorTacticFixed = 0;
 let campaignMismatchesFlagged = 0;
 let deliverablesLocked = 0;
+let missingDeliverableFlagged = 0;
 
 if (recordsToCreate.length > 0) {
     while (recordsToCreate.length > 0) {
@@ -976,7 +1014,15 @@ if (deliverableLockUpdates.length > 0) {
     }
 }
 
-console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Vendor/Tactic Fixed: ${vendorTacticFixed}, Campaign Mismatches Flagged: ${campaignMismatchesFlagged}, Deliverable Lock Updates: ${deliverablesLocked}`);
+if (missingDeliverableUpdates.length > 0) {
+    while (missingDeliverableUpdates.length > 0) {
+        const batch = missingDeliverableUpdates.splice(0, 50);
+        await actualisationTable.updateRecordsAsync(batch);
+        missingDeliverableFlagged += batch.length;
+    }
+}
+
+console.log(`✅ Forecast Complete! Created: ${created}, Updated: ${updated}, Maintained: ${maintained}, Flagged: ${flagged}, Duplicates Flagged: ${duplicatesFlagged}, Vendor/Tactic Fixed: ${vendorTacticFixed}, Campaign Mismatches Flagged: ${campaignMismatchesFlagged}, Deliverable Lock Updates: ${deliverablesLocked}, Missing Deliverable Link Errors: ${missingDeliverableFlagged}`);
 
 if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCreated', created);
@@ -987,5 +1033,6 @@ if (typeof output !== 'undefined' && typeof output.set === 'function') {
     output.set('recordsCampaignMismatchesFlagged', campaignMismatchesFlagged);
     output.set('recordsFlagged', flagged);
     output.set('deliverablesLockUpdated', deliverablesLocked);
+    output.set('recordsMissingDeliverableFlagged', missingDeliverableFlagged);
     output.set('status', 'success');
 }
