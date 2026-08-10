@@ -20,8 +20,15 @@ Pre Actualisation Process → PM/COs Actualise → MD Verification → Final App
 
 Timing: this happens on **Weekday 1**, after Regional Media Ops Teams have filled in Actual Spend (goal: closed by 12pm) and after the Primary owner's own warning check — same day, before the month gets locked via the approval checkbox.
 
+`scripts/calculate-actual-tactic-cost.js` ("Script 3") sits in between: it needs Actual Spend already filled in for the month, and its output (Actual Tactic Cost, and any Data Warnings it adds) is one of the things you check in step 1 below — so it has to run after Regional Media Ops Teams finish Actual Spend entry, and before you start your pull.
+
+**When to run Script 3:** it's month-aware on its own (it always targets the calendar month before the run date), so it's safe to trigger it any time after Actual Spend entry finishes for the month, up until you start your checks. Two ways to set that up, either is fine:
+- **Automated** — schedule it (e.g. an Airtable Automation with a scheduled/cron trigger, or a trigger on Actual Spend being updated) shortly after the Weekday 1 close goal, the same pattern as Script 1 (daily) and Script 2 (Day 28) in the cadence table. No one has to remember to run it.
+- **Manual** — Regional Media Ops Teams (or whoever runs Script 3) triggers it themselves once they've finished Actual Spend entry for the month, as the last task of Weekday 1, before handing off to MD Verification.
+
 ## Step-by-step
 
+0. **Confirm Script 3 (Calculate Actual Tactic Cost) has run for this month.** Spot-check a few Actual records — `Actual Tactic Cost` should be populated wherever `Actual Spend` is. If it hasn't run yet, run it (or wait for its scheduled run) before continuing — otherwise you'll be checking incomplete data.
 1. **Pull every open issue before looking at a single number.** Don't verify formulas first — an error underneath will just resurface after you've already spent time on the math. Check, in this order:
    - **Monthly Actualisation table** → filter `Data Warnings` is not empty
    - **Deliverables table** → filter `Deliverable Warnings` is not empty
@@ -50,6 +57,9 @@ Timing: this happens on **Weekday 1**, after Regional Media Ops Teams have fille
 | Vendor/Tactic auto-fix (record's own label rewritten to match its Deliverable) | Automation run log only — no warning written to the record | Not blocking, informational only | No escalation needed | Nothing — this is self-healing by design |
 | Leftover issue from the **Weekly Budget Categorization / Date Validation** check (still open at month-end) | Weekly "Budget Check" / "Missing Dates" views on Deliverables/Campaigns | Advisory unless it's blocking a current-month Forecast/Actual record, in which case treat it as Blocking via the row above | Media Ops Team Lead (owner of the weekly check) | Complete the weekly check that was missed |
 | Leftover issue from the **Monthly Pre-Close Campaign Status & Date Audit** (still open by Weekday 1) | Campaigns/Deliverables tables directly | **Blocking** if it means Script 2 converted the wrong campaigns to Actual this cycle | Regional Ops Leads (owner of that audit) | Correct campaign status/dates; may require manually fixing this month's Actual conversion if it already ran wrong |
+| `Missing Budget Category - Actual Tactic Cost was calculated using the 0% default margin rate...` (Script 3) | Monthly Actualisation → Data Warnings | Advisory (a value is there, just on a fallback rate) | Campaign Owner / Media Planner | Set the correct Budget Category on the Deliverable, then re-run Script 3 (or manually correct Actual Tactic Cost) so it uses the right margin rate |
+| `External 3rd Party record with no resolvable tmp Office...` (Script 3) | Monthly Actualisation → Data Warnings | Advisory | Campaign Owner / Media Planner | Confirm the Campaign's TMP Office is set; re-check whether the 15% EMEA rate should have applied instead of 0% |
+| `Internal Programmatic record with no resolvable Client...` (Script 3) | Monthly Actualisation → Data Warnings | Advisory | Campaign Owner / Media Planner | Confirm the Campaign's Client link is set; re-check whether the 30% Anaplan/Fortinet rate should have applied instead of the 50% default |
 
 ## How to escalate
 
